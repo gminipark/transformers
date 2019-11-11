@@ -25,6 +25,7 @@ import sys
 from io import open
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 
@@ -224,7 +225,20 @@ try:
     from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
 except (ImportError, AttributeError) as e:
     logger.info("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex .")
-    BertLayerNorm = torch.nn.LayerNorm
+    class BertLayerNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-12):
+            """Construct a layernorm module in the TF style (epsilon inside the square root).
+            """
+            super(BertLayerNorm, self).__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.bias = nn.Parameter(torch.zeros(hidden_size))
+            self.variance_epsilon = eps
+
+        def forward(self, x):
+            u = x.mean(-1, keepdim=True)
+            s = (x - u).pow(2).mean(-1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+            return self.weight * x + self.bias
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
@@ -337,30 +351,23 @@ class BertAttention(nn.Module):
         super(BertAttention, self).__init__()
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
-        self.pruned_heads = set()
 
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
         mask = torch.ones(self.self.num_attention_heads, self.self.attention_head_size)
-        heads = set(heads) - self.pruned_heads  # Convert to set and emove already pruned heads
         for head in heads:
-            # Compute how many pruned heads are before the head and move the index accordingly
-            head = head - sum(1 if h < head else 0 for h in self.pruned_heads)
             mask[head] = 0
         mask = mask.view(-1).contiguous().eq(1)
         index = torch.arange(len(mask))[mask].long()
-
         # Prune linear layers
         self.self.query = prune_linear_layer(self.self.query, index)
         self.self.key = prune_linear_layer(self.self.key, index)
         self.self.value = prune_linear_layer(self.self.value, index)
         self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
+        # Update hyper params
         self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
         self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
 
     def forward(self, input_tensor, attention_mask, head_mask=None):
         self_outputs = self.self(input_tensor, attention_mask, head_mask)
@@ -538,8 +545,12 @@ class BertPreTrainedModel(PreTrainedModel):
     load_tf_weights = load_tf_weights_in_bert
     base_model_prefix = "bert"
 
-    def _init_weights(self, module):
-        """ Initialize the weights """
+    def __init__(self, *inputs, **kwargs):
+        super(BertPreTrainedModel, self).__init__(*inputs, **kwargs)
+
+    def init_weights(self, module):
+        """ Initialize the weights.
+        """
         if isinstance(module, (nn.Linear, nn.Embedding)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
@@ -652,7 +663,7 @@ class BertModel(BertPreTrainedModel):
         self.encoder = BertEncoder(config)
         self.pooler = BertPooler(config)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def _resize_token_embeddings(self, new_num_tokens):
         old_embeddings = self.embeddings.word_embeddings
@@ -761,7 +772,7 @@ class BertForPreTraining(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.cls = BertPreTrainingHeads(config)
 
-        self.init_weights()
+        self.apply(self.init_weights)
         self.tie_weights()
 
     def tie_weights(self):
@@ -829,7 +840,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.cls = BertOnlyMLMHead(config)
 
-        self.init_weights()
+        self.apply(self.init_weights)
         self.tie_weights()
 
     def tie_weights(self):
@@ -894,7 +905,7 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.cls = BertOnlyNSPHead(config)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, next_sentence_label=None,
                 position_ids=None, head_mask=None):
@@ -955,7 +966,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None):
@@ -995,15 +1006,15 @@ class BertForMultipleChoice(BertPreTrainedModel):
             (a) For sequence pairs:
 
                 ``tokens:         [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]``
-                
+
                 ``token_type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1``
 
             (b) For single sequences:
 
                 ``tokens:         [CLS] the dog is hairy . [SEP]``
-                
+
                 ``token_type_ids:   0   0   0   0  0     0   0``
-    
+
             Indices can be obtained using :class:`pytorch_transformers.BertTokenizer`.
             See :func:`pytorch_transformers.PreTrainedTokenizer.encode` and
             :func:`pytorch_transformers.PreTrainedTokenizer.convert_tokens_to_ids` for details.
@@ -1059,11 +1070,12 @@ class BertForMultipleChoice(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, 1)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None):
         num_choices = input_ids.shape[1]
+
 
         flat_input_ids = input_ids.view(-1, input_ids.size(-1))
         flat_position_ids = position_ids.view(-1, position_ids.size(-1)) if position_ids is not None else None
@@ -1127,7 +1139,7 @@ class BertForTokenClassification(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None):
@@ -1201,7 +1213,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 
-        self.init_weights()
+        self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, start_positions=None,
                 end_positions=None, position_ids=None, head_mask=None):
@@ -1233,3 +1245,62 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+class BertForAnswerSelection(BertPreTrainedModel):
+    def __init__(self, config):
+        super(BertForAnswerSelection, self).__init__(config)
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Sequential(nn.Linear(config.hidden_size * 2, config.hidden_size),
+                                        nn.ReLU(),
+                                        nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size, 1))
+
+        self.num_labels = config.num_labels
+        self.apply(self.init_weights)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, head_mask=None):
+
+        # batch * num_labels * 2 * batch_size
+        num_choices = input_ids.size(1)
+
+        flat_input_ids = input_ids.view(-1, input_ids.size(-1))
+        flat_position_ids = position_ids.view(-1, position_ids.size(-1)) if position_ids is not None else None
+        flat_token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1)) if token_type_ids is not None else None
+        flat_attention_mask = attention_mask.view(-1, attention_mask.size(-1)) if attention_mask is not None else None
+        outputs = self.bert(flat_input_ids, position_ids=flat_position_ids, token_type_ids=flat_token_type_ids,
+                            attention_mask=flat_attention_mask, head_mask=head_mask)
+        pooled_output = outputs[1]
+
+        # (batch * num_labels * 2) * hidden_size
+        pooled_output = self.dropout(pooled_output)
+
+        # batch * num_labels * 2 * hidden_size
+        reshaped_pooled_output = pooled_output.view(-1, num_choices, pooled_output.size(-1))
+
+        # batch  * hidden_size
+        dq_pooled_output, sdq_pooled_output = reshaped_pooled_output.split(self.num_labels, dim=1)
+
+        dq_pooled_output = dq_pooled_output.contiguous().view(-1, dq_pooled_output.size(-1))
+        sdq_pooled_output = sdq_pooled_output.contiguous().view(-1, sdq_pooled_output.size(-1))
+
+        # fusion_output = self.fusion_gate(dq_pooled_output, da_pooled_output)
+        concated_output = torch.cat([dq_pooled_output, sdq_pooled_output], -1)
+
+        logits = self.classifier(concated_output)
+
+        reshaped_logits = logits.view(-1, self.num_labels)
+
+
+        outputs = (reshaped_logits,) + outputs[2:]  # add hidden states and attention if they are here
+
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(reshaped_logits, labels)
+            outputs = (loss,) + outputs
+
+        return outputs  # (loss), reshaped_logits, (hidden_states), (attentions)
+

@@ -1,4 +1,4 @@
-__version__ = "1.2.0"
+__version__ = "1.1.0"
 from .tokenization_auto import AutoTokenizer
 from .tokenization_bert import BertTokenizer, BasicTokenizer, WordpieceTokenizer
 from .tokenization_openai import OpenAIGPTTokenizer
@@ -11,13 +11,13 @@ from .tokenization_distilbert import DistilBertTokenizer
 
 from .tokenization_utils import (PreTrainedTokenizer)
 
-from .modeling_auto import (AutoConfig, AutoModel, AutoModelForSequenceClassification, AutoModelForQuestionAnswering,
-                            AutoModelWithLMHead)
+from .modeling_auto import (AutoConfig, AutoModel)
 
 from .modeling_bert import (BertConfig, BertPreTrainedModel, BertModel, BertForPreTraining,
                             BertForMaskedLM, BertForNextSentencePrediction,
                             BertForSequenceClassification, BertForMultipleChoice,
                             BertForTokenClassification, BertForQuestionAnswering,
+                            BertForAnswerSelection,
                             load_tf_weights_in_bert, BERT_PRETRAINED_MODEL_ARCHIVE_MAP,
                             BERT_PRETRAINED_CONFIG_ARCHIVE_MAP)
 from .modeling_openai import (OpenAIGPTConfig, OpenAIGPTPreTrainedModel, OpenAIGPTModel,
